@@ -1,0 +1,6 @@
+qdrant_db/
+vllm-env/
+data/
+_pycache_/
+rag_api.log
+
