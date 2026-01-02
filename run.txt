@@ -1,0 +1,6 @@
+
+vllm serve casperhansen/llama-3-8b-instruct-awq \
+    --max-model-len 4096 \
+    --gpu-memory-utilization 0.6 \
+    --port 8282 \
+    --dtype half

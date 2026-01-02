@@ -1,697 +1,507 @@
-from fastapi import FastAPI, Request
-from pydantic import BaseModel
-from langchain_community.embeddings import HuggingFaceEmbeddings
+import os
+import re
+import glob
+import time
+import json
+import hashlib
+import torch
+import logging
+import numpy as np
+from uuid import uuid4
+from typing import List, Optional, Dict, Any
+from concurrent.futures import ThreadPoolExecutor
+from dotenv import load_dotenv
+
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters.character import RecursiveCharacterTextSplitter
-from langchain_qdrant import QdrantVectorStore
-from langchain_core.prompts import PromptTemplate
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-import logging
-import time
-import os
-import glob
-from uuid import uuid4
-from datetime import datetime
-from contextlib import asynccontextmanager
-from typing import TypedDict, List
-from langgraph.graph import StateGraph, END
-
-# ─────────────────────────────────────────────────────────────
-# LANGGRAPH STATE DEFINITION
-# ─────────────────────────────────────────────────────────────
-class GraphState(TypedDict):
-    question: str
-    original_question: str  # For tracking rewrites
-    context: str
-    answer: str
-    retrieval_time: float
-    llm_time: float
-    complexity: str  # SIMPLE, MEDIUM, COMPLEX
-    relevance_score: float  # 0.0-1.0
-    retry_count: int  # Track rewrite attempts
-
-# ─────────────────────────────────────────────────────────────
-# LOGGING SETUP
-# ─────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)-8s | %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[
-        logging.FileHandler('rag_api.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+from qdrant_client.http.models import (
+    Distance, VectorParams, SparseVectorParams, SparseIndexParams,
+    SparseVector, Filter, FieldCondition, MatchValue,
+    PointStruct, Prefetch, FusionQuery
 )
+from sentence_transformers import CrossEncoder
+from transformers import AutoTokenizer
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+os.environ["TQDM_DISABLE"] = "1"
 
-# ─────────────────────────────────────────────────────────────
-# METRICS TRACKING
-# ─────────────────────────────────────────────────────────────
-class Metrics:
-    def __init__(self):
-        self.total_requests = 0
-        self.successful_requests = 0
-        self.failed_requests = 0
-        self.total_retrieval_time = 0.0
-        self.total_llm_time = 0.0
-        self.total_response_time = 0.0
-        self.start_time = datetime.now()
-    
-    def record_request(self, success: bool, retrieval_time: float, llm_time: float, total_time: float):
-        self.total_requests += 1
-        if success:
-            self.successful_requests += 1
-        else:
-            self.failed_requests += 1
-        self.total_retrieval_time += retrieval_time
-        self.total_llm_time += llm_time
-        self.total_response_time += total_time
-    
-    def get_stats(self):
-        uptime = (datetime.now() - self.start_time).total_seconds()
-        return {
-            "total_requests": self.total_requests,
-            "successful_requests": self.successful_requests,
-            "failed_requests": self.failed_requests,
-            "success_rate": round(self.successful_requests / self.total_requests * 100, 2) if self.total_requests > 0 else 0,
-            "avg_retrieval_time": round(self.total_retrieval_time / self.total_requests, 3) if self.total_requests > 0 else 0,
-            "avg_llm_time": round(self.total_llm_time / self.total_requests, 3) if self.total_requests > 0 else 0,
-            "avg_response_time": round(self.total_response_time / self.total_requests, 3) if self.total_requests > 0 else 0,
-            "requests_per_second": round(self.total_requests / uptime, 2) if uptime > 0 else 0,
-            "uptime_seconds": round(uptime, 2)
-        }
+load_dotenv()
 
-metrics = Metrics()
+VLLM_URL = os.getenv("VLLM_BASE_URL", "http://localhost:8282/v1")
+VLLM_MODEL = os.getenv("VLLM_MODEL", "casperhansen/llama-3-8b-instruct-awq")
+COLLECTION = "documents"
+TOTAL_MAX_TOKENS = 3500
+PROMPT_OVERHEAD = 300
+HYDE_WEIGHT = float(os.getenv("HYDE_WEIGHT", "0.4"))
+RETRIEVER_K = int(os.getenv("RETRIEVER_K", "20"))
+RERANK_THRESHOLD_BASE = float(os.getenv("RERANK_THRESHOLD_BASE", "-6.0"))
+MAX_ANSWER_HISTORY_TOKENS = int(os.getenv("MAX_ANSWER_HISTORY_TOKENS", "200"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 
-# ─────────────────────────────────────────────────────────────
-# LIFESPAN (Startup/Shutdown)
-# ─────────────────────────────────────────────────────────────
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Starting RAG API Server...")
-    logger.info("Model: Qwen/Qwen2.5-3B-Instruct")
-    logger.info("Vector DB: Qdrant")
-    logger.info("vLLM Endpoint: http://localhost:8082/v1")
+ENABLE_GENERAL_FALLBACK = os.getenv("ENABLE_GENERAL_FALLBACK", "true").lower() == "true"
+ENABLE_HYBRID_SEARCH = os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "true"
+ENABLE_PARENT_RETRIEVER = os.getenv("ENABLE_PARENT_RETRIEVER", "true").lower() == "true"
+CHILD_CHUNK_SIZE = int(os.getenv("CHILD_CHUNK_SIZE", "200"))
+PARENT_CHUNK_SIZE = int(os.getenv("PARENT_CHUNK_SIZE", "1200"))
+
+try:
+    tokenizer = AutoTokenizer.from_pretrained(VLLM_MODEL)
+    logger.info(f"Loaded tokenizer: {VLLM_MODEL}")
+except Exception as e:
+    logger.warning(f"Failed to load tokenizer: {e}")
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+
+def count_tokens(text: str) -> int:
+    return len(tokenizer.encode(text, add_special_tokens=False))
+
+def truncate_text(text: str, max_tokens: int) -> str:
+    tokens = tokenizer.encode(text, add_special_tokens=False)
+    if len(tokens) <= max_tokens:
+        return text
+    return tokenizer.decode(tokens[:max_tokens], skip_special_tokens=True) + "..."
+
+def normalize_turkish(text: str) -> str:
+    text = text.lower()
+    replacements = {'ı': 'i', 'İ': 'i', 'ğ': 'g', 'Ğ': 'g', 'ü': 'u', 'Ü': 'u',
+                   'ş': 's', 'Ş': 's', 'ö': 'o', 'Ö': 'o', 'ç': 'c', 'Ç': 'c'}
+    for tr, en in replacements.items():
+        text = text.replace(tr, en)
+    return text
+
+def get_doc_weight(metadata: Dict) -> float:
+    if 'doc_weight' in metadata:
+        return metadata['doc_weight']
+    return 1.0
+
+def compute_dynamic_threshold(query: str, docs: List) -> float:
+    base = RERANK_THRESHOLD_BASE
+    query_tokens = count_tokens(query)
+    if query_tokens > 20:
+        base += 0.5
+    elif query_tokens < 5:
+        base -= 1.0
+    if len(docs) < 5:
+        base -= 1.5
+    elif len(docs) > 15:
+        base += 0.5
+    return base
+
+def compute_sparse_vector(text: str) -> Dict[str, Any]:
+    words = re.findall(r'\b\w+\b', text.lower())
+    tf = {}
+    for word in words:
+        if len(word) > 2:
+            tf[word] = tf.get(word, 0) + 1
+    if not tf:
+        return {"indices": [], "values": []}
     
-    # Ensure collection exists first
-    ensure_qdrant_collection(reset=False)
-    
-    # Auto-index if Qdrant is empty and PDFs exist
-    try:
-        collection_info = qdrant_client.get_collection(COLLECTION_NAME)
-        doc_count = collection_info.points_count
-        logger.info(f"Qdrant collection status: {doc_count} documents")
+    # Use a dictionary to aggregate values for colliding indices
+    vector_map = {}
+    max_tf = max(tf.values())
+    for word, count in tf.items():
+        idx = abs(hash(word) % 100000)
+        val = np.log(1 + count / max_tf)
+        vector_map[idx] = vector_map.get(idx, 0.0) + val
         
-        if doc_count == 0:
-            # Check if PDF files exist in data/ folder
-            pdf_files = glob.glob(os.path.join("data", "*.pdf"))
-            if pdf_files:
-                logger.info(f"Qdrant is empty. Auto-indexing {len(pdf_files)} PDF file(s)...")
-                req = IndexRequest(
-                    pdf_folder="data",
-                    glob_pattern="*.pdf",
-                    chunk_size=800,
-                    chunk_overlap=120,
-                    reset_collection=False
-                )
-                result = index_pdfs_sync(req)
-                if result.get("chunks_indexed", 0) > 0:
-                    logger.info(f"Auto-indexing complete: {result['chunks_indexed']} chunks indexed from {result['files_indexed']} files")
-                else:
-                    logger.warning(f"Auto-indexing found no PDFs to index")
-            else:
-                logger.info("Qdrant is empty but no PDF files found in data/ folder. Use /index endpoint to add documents.")
-        else:
-            logger.info(f"Qdrant already contains {doc_count} documents. Skipping auto-indexing.")
-    except Exception as e:
-        logger.warning(f"Auto-indexing check failed: {e}. You may need to manually index PDFs via /index endpoint.")
-    
-    yield
-    logger.info("Shutting down RAG API Server...")
+    return {"indices": list(vector_map.keys()), "values": list(vector_map.values())}
 
-app = FastAPI(
-    title="RAG API with vLLM",
-    description="Production-ready RAG API with detailed logging and metrics",
-    version="2.1.0",
-    lifespan=lifespan
-)
+def clean_text(text: str) -> str:
+    text = " ".join(text.split())
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+    return text
 
-executor = ThreadPoolExecutor(max_workers=50)
+def get_files_hash(file_list: List[str]) -> str:
+    hasher = hashlib.md5()
+    for file_path in sorted(file_list):
+        stats = os.stat(file_path)
+        hasher.update(f"{file_path}{stats.st_mtime}".encode("utf-8"))
+    return hasher.hexdigest()
 
-# ─────────────────────────────────────────────────────────────
-# EMBEDDINGS CONFIGURATION
-# ─────────────────────────────────────────────────────────────
+embed_device = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"Embeddings device: {embed_device}")
+
 embeddings = HuggingFaceEmbeddings(
     model_name="BAAI/bge-m3",
-    model_kwargs={"device": "cpu"},
+    model_kwargs={"device": embed_device},
     encode_kwargs={"normalize_embeddings": True}
 )
 
-# BAAI/bge-m3 produces 1024-dimensional vectors
-EMBEDDING_DIM = 1024
+client = QdrantClient(path="./qdrant_db")
+parent_store: Dict[str, str] = {}
 
-# ─────────────────────────────────────────────────────────────
-# QDRANT VECTORSTORE CONFIGURATION
-# ─────────────────────────────────────────────────────────────
-QDRANT_PATH = "./qdrant_db"
-COLLECTION_NAME = "my_documents"
-
-# Initialize Qdrant client (on-disk storage)
-qdrant_client = QdrantClient(path=QDRANT_PATH)
-
-# Create collection if it doesn't exist
-def ensure_qdrant_collection(reset: bool = False) -> None:
-    """Ensure Qdrant collection exists (optionally reset)."""
-    if reset:
-        try:
-            qdrant_client.delete_collection(COLLECTION_NAME)
-            logger.warning(f"Deleted Qdrant collection (reset=true): {COLLECTION_NAME}")
-        except Exception:
-            # collection may not exist
-            pass
-
-    try:
-        qdrant_client.get_collection(COLLECTION_NAME)
-        logger.info(f"Loaded existing Qdrant collection: {COLLECTION_NAME}")
-        return
-    except Exception:
-        logger.info(f"Creating new Qdrant collection: {COLLECTION_NAME}")
-        qdrant_client.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
-        )
-
-ensure_qdrant_collection(reset=False)
-
-# Initialize vectorstore
-vectorstore = QdrantVectorStore(
-    client=qdrant_client,
-    collection_name=COLLECTION_NAME,
-    embedding=embeddings,
-)
-
-# ─────────────────────────────────────────────────────────────
-# LLM CONFIGURATION (vLLM + Qwen)
-# ─────────────────────────────────────────────────────────────
-llm = ChatOpenAI(
-    model="Qwen/Qwen2.5-3B-Instruct",
-    openai_api_key="EMPTY",
-    openai_api_base="http://localhost:8082/v1",
-    temperature=0.3,
-    max_tokens=512,
-)
-
-retriever = vectorstore.as_retriever(
-    search_type="similarity",
-    search_kwargs={"k": 6}
-)
-
-# ─────────────────────────────────────────────────────────────
-# PROMPT TEMPLATE
-# ─────────────────────────────────────────────────────────────
-prompt = PromptTemplate(
-    input_variables=["context", "question"],
-    template="""You are a RAG assistant. Answer ONLY using the given CONTEXT.
-
-CRITICAL RULES:
-1. Use ONLY information from CONTEXT
-2. Do NOT add external knowledge
-3. Do NOT guess or hallucinate
-4. If CONTEXT is empty or IRRELEVANT to the question, respond exactly with:
-   "Answer not found in context."
-5. Write the answer in Turkish using ASCII characters
-
-CONTEXT:
-{context}
-
-QUESTION: {question}
-
-ANSWER:"""
-)
-
-def format_docs(docs):
-    if not docs:
-        return ""
-    return "\n\n".join(doc.page_content for doc in docs)
-
-# ─────────────────────────────────────────────────────────────
-# QUERY PROCESSING
-# ─────────────────────────────────────────────────────────────
-class Query(BaseModel):
-    question: str
-
-class IndexRequest(BaseModel):
-    pdf_folder: str = "data"
-    glob_pattern: str = "*.pdf"
-    max_files: int | None = None
-    chunk_size: int = 800
-    chunk_overlap: int = 120
-    reset_collection: bool = False
-
-def index_pdfs_sync(req: IndexRequest) -> dict:
-    """Load PDFs, split into chunks, and upsert into Qdrant."""
-    start_total = time.time()
-
-    ensure_qdrant_collection(reset=req.reset_collection)
-
-    pdf_files = sorted(glob.glob(os.path.join(req.pdf_folder, req.glob_pattern)))
-    if req.max_files is not None:
-        pdf_files = pdf_files[: req.max_files]
-
+def index_documents():
+    global parent_store
+    pdf_files = glob.glob("data/*.pdf")
     if not pdf_files:
-        return {
-            "status": "ok",
-            "message": "No PDF files found to index.",
-            "pdf_folder": req.pdf_folder,
-            "glob_pattern": req.glob_pattern,
-            "files_indexed": 0,
-            "pages_loaded": 0,
-            "chunks_indexed": 0,
-            "total_seconds": round(time.time() - start_total, 3),
-        }
+        print("No PDF files found in data/")
+        return
 
-    pages = []
-    for pdf_path in pdf_files:
-        loader = PyPDFLoader(pdf_path)
-        pages.extend(loader.load())
+    cache_file = "data/.index_cache"
+    settings_hash = f"_{CHUNK_SIZE}_{CHUNK_OVERLAP}_{ENABLE_HYBRID_SEARCH}_{ENABLE_PARENT_RETRIEVER}"
+    current_hash = get_files_hash(pdf_files) + settings_hash
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=req.chunk_size,
-        chunk_overlap=req.chunk_overlap,
+    if os.path.exists(cache_file):
+        with open(cache_file, "r") as f:
+            cached = f.read().strip()
+        if cached == current_hash:
+            try:
+                info = client.get_collection(COLLECTION)
+                if info.points_count > 0:
+                    print(f"Index up-to-date ({info.points_count} chunks). Skipping.")
+                    if os.path.exists("data/.parent_store.json"):
+                        with open("data/.parent_store.json", "r") as f:
+                            parent_store = json.load(f)
+                    return
+            except:
+                pass
+
+    print(f"Indexing {len(pdf_files)} PDF(s)...")
+    documents = []
+    for pdf in pdf_files:
+        loader = PyPDFLoader(pdf)
+        docs = loader.load()
+        filename = os.path.basename(pdf)
+        
+        for d in docs:
+            d.page_content = clean_text(d.page_content)
+            d.page_content = f"[Source: {filename}]\n{d.page_content}"
+        documents.extend(docs)
+
+    if client.collection_exists(COLLECTION):
+        client.delete_collection(COLLECTION)
+
+    vectors_config = {"dense": VectorParams(size=1024, distance=Distance.COSINE)}
+    sparse_config = None
+    if ENABLE_HYBRID_SEARCH:
+        sparse_config = {"sparse": SparseVectorParams(index=SparseIndexParams(on_disk=False))}
+
+    client.create_collection(
+        collection_name=COLLECTION,
+        vectors_config=vectors_config,
+        sparse_vectors_config=sparse_config
     )
-    chunks = splitter.split_documents(pages)
 
-    ids = [str(uuid4()) for _ in range(len(chunks))]
-    vectorstore.add_documents(documents=chunks, ids=ids)
-
-    total_time = time.time() - start_total
-    logger.info(
-        f"Index OK | Files: {len(pdf_files)} | Pages: {len(pages)} | Chunks: {len(chunks)} | Total: {total_time:.3f}s"
-    )
-
-    return {
-        "status": "ok",
-        "pdf_folder": req.pdf_folder,
-        "glob_pattern": req.glob_pattern,
-        "files_indexed": len(pdf_files),
-        "pages_loaded": len(pages),
-        "chunks_indexed": len(chunks),
-        "total_seconds": round(total_time, 3),
-    }
-
-# ─────────────────────────────────────────────────────────────
-# LANGGRAPH NODES
-# ─────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────
-# LANGGRAPH NODES - ADAPTIVE & SELF-CORRECTION
-# ─────────────────────────────────────────────────────────────
-
-def classify_question(state: GraphState):
-    """
-    Classify question complexity: SIMPLE, MEDIUM, COMPLEX
-    """
-    question = state["question"]
-    
-    classify_prompt = f"""Classify this question's complexity. Reply with ONLY one word: SIMPLE, MEDIUM, or COMPLEX.
-
-SIMPLE: Greetings, basic questions that don't need document retrieval (e.g., "Hello", "Thanks")
-MEDIUM: Straightforward factual questions (e.g., "What is vLLM?")
-COMPLEX: Multi-part or comparative questions (e.g., "Compare vLLM and TensorRT performance")
-
-Question: {question}
-
-Classification:"""
-    
-    try:
-        response = llm.invoke(classify_prompt)
-        complexity = response.content.strip().upper()
+    if ENABLE_PARENT_RETRIEVER:
+        parent_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=PARENT_CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+        child_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHILD_CHUNK_SIZE, chunk_overlap=50,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+        parent_chunks = parent_splitter.split_documents(documents)
+        all_child_chunks = []
+        parent_store = {}
         
-        # Validate response
-        if complexity not in ["SIMPLE", "MEDIUM", "COMPLEX"]:
-            complexity = "MEDIUM"  # Default fallback
+        for parent in parent_chunks:
+            parent_id = str(uuid4())
+            children = child_splitter.split_documents([parent])
+            for child in children:
+                child_id = str(uuid4())
+                child.metadata['child_id'] = child_id
+                child.metadata['parent_id'] = parent_id
+                parent_store[child_id] = parent.page_content
+                all_child_chunks.append((child_id, child))
         
-        logger.info(f"Question classified as: {complexity} | Q: {question[:40]}...")
-        return {"complexity": complexity}
-    except Exception as e:
-        logger.warning(f"Classification failed: {e}, defaulting to MEDIUM")
-        return {"complexity": "MEDIUM"}
-
-def direct_answer(state: GraphState):
-    """
-    Answer simple questions directly without retrieval (e.g., greetings)
-    """
-    start_time = time.time()
-    question = state["question"]
-    
-    simple_prompt = f"""You are a helpful assistant. Answer this simple question briefly and politely.
-
-Question: {question}
-
-Answer:"""
-    
-    response = llm.invoke(simple_prompt)
-    llm_time = time.time() - start_time
-    
-    logger.info(f"Direct answer (no retrieval) | LLM: {llm_time:.3f}s | Q: {question[:40]}...")
-    
-    return {
-        "answer": response.content,
-        "llm_time": llm_time,
-        "retrieval_time": 0.0,
-        "context": "",
-        "relevance_score": 1.0
-    }
-
-def retrieve(state: GraphState):
-    """
-    Retrieve documents with adaptive k based on complexity.
-    """
-    start_time = time.time()
-    question = state["question"]
-    complexity = state.get("complexity", "MEDIUM")
-    
-    # Adaptive retrieval: adjust k based on complexity
-    k_map = {"SIMPLE": 3, "MEDIUM": 6, "COMPLEX": 10}
-    k = k_map.get(complexity, 6)
-    
-    # Update retriever with adaptive k
-    adaptive_retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": k}
-    )
-    
-    retrieved_docs = adaptive_retriever.invoke(question)
-    retrieval_time = time.time() - start_time
-    
-    if not retrieved_docs:
-        logger.warning(f"No docs found | Q: {question[:50]}... | Retrieval: {retrieval_time:.3f}s")
-        return {
-            "context": "",
-            "retrieval_time": retrieval_time,
-            "relevance_score": 0.0
-        }
-    
-    context = format_docs(retrieved_docs)
-    logger.info(f"Retrieved {len(retrieved_docs)} docs (k={k}) | Time: {retrieval_time:.3f}s")
-    
-    return {
-        "context": context,
-        "retrieval_time": retrieval_time
-    }
-
-def grade_documents(state: GraphState):
-    """
-    Grade document relevance using LLM.
-    Returns relevance score (0.0-1.0).
-    """
-    question = state["question"]
-    context = state["context"]
-    
-    if not context:
-        return {"relevance_score": 0.0}
-    
-    grade_prompt = f"""You are a grading assistant. Evaluate if the CONTEXT is relevant to answer the QUESTION.
-
-Reply with ONLY one word: RELEVANT or IRRELEVANT
-
-QUESTION: {question}
-
-CONTEXT:
-{context[:1000]}...
-
-Evaluation:"""
-    
-    try:
-        response = llm.invoke(grade_prompt)
-        grade = response.content.strip().upper()
-        
-        relevance_score = 1.0 if "RELEVANT" in grade else 0.0
-        
-        logger.info(f"Document grading: {grade} (score={relevance_score}) | Q: {question[:40]}...")
-        return {"relevance_score": relevance_score}
-    except Exception as e:
-        logger.warning(f"Grading failed: {e}, assuming relevant")
-        return {"relevance_score": 0.5}
-
-def rewrite_query(state: GraphState):
-    """
-    Rewrite the query to improve retrieval quality.
-    """
-    question = state["question"]
-    retry_count = state.get("retry_count", 0)
-    
-    rewrite_prompt = f"""You are a query optimization expert. Rewrite this question to be more specific and retrieval-friendly.
-
-Original question: {question}
-
-Rewritten question (be concise, keep the same language):"""
-    
-    try:
-        response = llm.invoke(rewrite_prompt)
-        rewritten = response.content.strip()
-        
-        logger.info(f"Query rewritten (attempt {retry_count + 1}): '{question[:30]}...' → '{rewritten[:30]}...'")
-        
-        return {
-            "question": rewritten,
-            "retry_count": retry_count + 1
-        }
-    except Exception as e:
-        logger.error(f"Query rewrite failed: {e}")
-        return {"retry_count": retry_count + 1}
-
-def generate(state: GraphState):
-    """
-    Generate answer using the LLM.
-    """
-    start_time = time.time()
-    question = state["original_question"]  # Use original question for answer
-    context = state["context"]
-    
-    # Early exit if no context found
-    if not context:
-        return {
-            "answer": "Answer not found in context.",
-            "llm_time": 0.0
-        }
-
-    formatted_prompt = prompt.format(context=context, question=question)
-    response = llm.invoke(formatted_prompt)
-    llm_time = time.time() - start_time
-    
-    return {
-        "answer": response.content,
-        "llm_time": llm_time
-    }
-
-# ─────────────────────────────────────────────────────────────
-# ROUTING FUNCTIONS
-# ─────────────────────────────────────────────────────────────
-
-def route_by_complexity(state: GraphState):
-    """Route based on question complexity."""
-    complexity = state.get("complexity", "MEDIUM")
-    
-    if complexity == "SIMPLE":
-        return "direct_answer"
+        chunks_to_index = all_child_chunks
+        with open("data/.parent_store.json", "w") as f:
+            json.dump(parent_store, f)
     else:
-        return "retrieve"
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+        chunks = splitter.split_documents(documents)
+        chunks_to_index = [(str(uuid4()), c) for c in chunks]
 
-def should_rewrite(state: GraphState):
-    """Decide if we should rewrite query based on relevance."""
-    relevance = state.get("relevance_score", 1.0)
-    retry_count = state.get("retry_count", 0)
+    print(f"Embedding {len(chunks_to_index)} chunks...")
+    points = []
+    batch_size = 32
     
-    # If documents are irrelevant and we haven't retried too many times
-    if relevance < 0.5 and retry_count < 2:
-        logger.info(f"Low relevance ({relevance}), rewriting query...")
-        return "rewrite"
-    else:
-        return "generate"
+    for i in range(0, len(chunks_to_index), batch_size):
+        batch = chunks_to_index[i:i+batch_size]
+        texts = [c.page_content for _, c in batch]
+        dense_vectors = embeddings.embed_documents(texts)
+        
+        for j, (chunk_id, chunk) in enumerate(batch):
+            point_vectors = {"dense": dense_vectors[j]}
+            if ENABLE_HYBRID_SEARCH:
+                sparse = compute_sparse_vector(chunk.page_content)
+                point_vectors["sparse"] = SparseVector(indices=sparse["indices"], values=sparse["values"])
+            
+            points.append(PointStruct(
+                id=chunk_id,
+                vector=point_vectors,
+                payload={"page_content": chunk.page_content, "metadata": chunk.metadata}
+            ))
+    
+    for i in range(0, len(points), 100):
+        client.upsert(collection_name=COLLECTION, points=points[i:i+100])
 
-# ─────────────────────────────────────────────────────────────
-# GRAPH CONSTRUCTION - ADVANCED RAG
-# ─────────────────────────────────────────────────────────────
-workflow = StateGraph(GraphState)
+    with open(cache_file, "w") as f:
+        f.write(current_hash)
+    
+    features = []
+    if ENABLE_HYBRID_SEARCH: features.append("Hybrid")
+    if ENABLE_PARENT_RETRIEVER: features.append("Parent-Doc")
+    print(f"Indexing Done! Features: {', '.join(features) if features else 'Standard'}")
 
-# Add nodes
-workflow.add_node("classify", classify_question)
-workflow.add_node("direct_answer", direct_answer)
-workflow.add_node("retrieve", retrieve)
-workflow.add_node("grade", grade_documents)
-workflow.add_node("rewrite", rewrite_query)
-workflow.add_node("generate", generate)
+def hybrid_search(query: str, k: int = RETRIEVER_K) -> List[Document]:
+    dense_query = embeddings.embed_query(query)
+    
+    if ENABLE_HYBRID_SEARCH:
+        sparse_query = compute_sparse_vector(query)
+        try:
+            results = client.query_points(
+                collection_name=COLLECTION,
+                prefetch=[
+                    Prefetch(query=dense_query, using="dense", limit=k * 2),
+                    Prefetch(
+                        query=SparseVector(indices=sparse_query["indices"], values=sparse_query["values"]),
+                        using="sparse", limit=k * 2
+                    )
+                ],
+                query=FusionQuery(fusion="rrf"),
+                limit=k,
+                with_payload=True
+            )
+            
+            docs = []
+            for point in results.points:
+                content = point.payload.get("page_content", "")
+                metadata = point.payload.get("metadata", {})
+                if ENABLE_PARENT_RETRIEVER and "child_id" in metadata:
+                    child_id = metadata["child_id"]
+                    if child_id in parent_store:
+                        content = parent_store[child_id]
+                        metadata["retrieved_as"] = "parent"
+                docs.append(Document(page_content=content, metadata=metadata))
+            return docs
+        except Exception as e:
+            logger.warning(f"Hybrid search failed: {e}")
+    
+    # Fallback to dense only
+    results = client.search(
+        collection_name=COLLECTION,
+        query_vector=("dense", dense_query),
+        limit=k,
+        with_payload=True
+    )
+    
+    docs = []
+    for point in results:
+        content = point.payload.get("page_content", "")
+        metadata = point.payload.get("metadata", {})
+        if ENABLE_PARENT_RETRIEVER and "child_id" in metadata:
+            if metadata["child_id"] in parent_store:
+                content = parent_store[metadata["child_id"]]
+        docs.append(Document(page_content=content, metadata=metadata))
+    return docs
 
-# Set entry point
-workflow.set_entry_point("classify")
+index_documents()
 
-# Add conditional routing from classify
-workflow.add_conditional_edges(
-    "classify",
-    route_by_complexity,
-    {
-        "direct_answer": "direct_answer",
-        "retrieve": "retrieve"
-    }
+device = "cuda" if torch.cuda.is_available() else "cpu"
+reranker = CrossEncoder("BAAI/bge-reranker-v2-m3", max_length=512, device=device)
+
+llm = ChatOpenAI(
+    base_url=VLLM_URL, api_key="EMPTY", model=VLLM_MODEL,
+    temperature=0.3, max_tokens=512
 )
 
-# Direct answer goes straight to END
-workflow.add_edge("direct_answer", END)
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """You are a helpful AI assistant answering questions based on the provided context.
 
-# After retrieval, grade the documents
-workflow.add_edge("retrieve", "grade")
+Rules:
+- Quote directly when possible
+- Synthesize from multiple sources
+- If info is missing, say so
 
-# After grading, decide: rewrite or generate
-workflow.add_conditional_edges(
-    "grade",
-    should_rewrite,
-    {
-        "rewrite": "rewrite",
-        "generate": "generate"
-    }
-)
+Always cite sources like [filename.pdf - p1]. Write in Turkish.
 
-# After rewrite, try retrieval again
-workflow.add_edge("rewrite", "retrieve")
+Context:
+{context}"""),
+    ("human", "History:\n{history}\n\nQuestion: {question}")
+])
 
-# After generation, we're done
-workflow.add_edge("generate", END)
+PROMPT_GENERAL_FALLBACK = ChatPromptTemplate.from_messages([
+    ("system", """Answer based on general knowledge, not documents.
+Start with: "📚 Bu bilgi dokümanlarınızda bulunamadı. Genel bilgi olarak:" """),
+    ("human", "{question}")
+])
 
-# Compile graph
-rag_graph = workflow.compile()
+HYDE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "You are a helpful AI assistant."),
+    ("human", "Write a short ideal answer to this question in Turkish:\nQuestion: {question}\nIdeal Answer:")
+])
 
-def process_query_sync(question: str) -> tuple[str, float, float, float]:
-    """
-    Synchronous query processing using LangGraph with adaptive retrieval and self-correction.
-    Returns: (answer, retrieval_time, llm_time, total_time)
-    """
-    start_total = time.time()
+def rerank_with_source(query: str, docs: List, hyde_answer: Optional[str] = None, max_tokens: int = 2500):
+    if not docs:
+        return None, [], []
+
+    threshold = compute_dynamic_threshold(query, docs)
+    scores_q = reranker.predict([[query, d.page_content] for d in docs])
+
+    if hyde_answer:
+        scores_h = reranker.predict([[hyde_answer, d.page_content] for d in docs])
+        scores = (1 - HYDE_WEIGHT) * scores_q + HYDE_WEIGHT * scores_h
+    else:
+        scores = scores_q.tolist() if hasattr(scores_q, "tolist") else list(scores_q)
+
+    weighted_scores = [s * get_doc_weight(d.metadata) for d, s in zip(docs, scores)]
+    ranked = sorted(zip(docs, weighted_scores), key=lambda x: x[1], reverse=True)
+    ranked = [(d, s) for d, s in ranked if s >= threshold]
+
+    if not ranked:
+        return None, [], []
+
+    result_parts, sources_used, chunks_used = [], [], []
+    total_tokens = 0
+
+    for d, score in ranked:
+        source = os.path.basename(d.metadata.get("source", "?"))
+        page = d.metadata.get("page", 0) + 1
+        part = f"[{source} - p{page}] (score: {score:.2f})\n{d.page_content}"
+        part_tokens = count_tokens(part)
+        if total_tokens + part_tokens > max_tokens:
+            break
+        result_parts.append(part)
+        sources_used.append(f"{source} (p{page})")
+        chunks_used.append((d, score))
+        total_tokens += part_tokens
+
+    return ("\n\n---\n\n".join(result_parts), sources_used, chunks_used) if result_parts else (None, [], [])
+
+def format_history(history: List, max_tokens: int = 800) -> tuple:
+    if not history:
+        return "None", 0
+    result, total = [], 0
+    for h in reversed(history):
+        answer = truncate_text(h['a'], MAX_ANSWER_HISTORY_TOKENS)
+        entry = f"Q: {h['q']}\nA: {answer}"
+        tokens = count_tokens(entry)
+        if total + tokens > max_tokens:
+            break
+        result.insert(0, entry)
+        total += tokens
+    return ("\n".join(result), total) if result else ("None", 0)
+
+def hyde_search(question: str):
+    hyde_answer = llm.invoke(HYDE_PROMPT.invoke({"question": question}), max_tokens=128).content.strip()
+    norm_question = normalize_turkish(question)
     
-    # Initialize state with all required fields
-    initial_state = {
-        "question": question,
-        "original_question": question,  # Keep original for final answer
-        "context": "",
-        "answer": "",
-        "retrieval_time": 0.0,
-        "llm_time": 0.0,
-        "complexity": "MEDIUM",
-        "relevance_score": 1.0,
-        "retry_count": 0
-    }
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        f1 = executor.submit(hybrid_search, hyde_answer, RETRIEVER_K)
+        f2 = executor.submit(hybrid_search, question, RETRIEVER_K)
+        f3 = executor.submit(hybrid_search, norm_question, RETRIEVER_K)
+        docs_hyde, docs_orig, docs_norm = f1.result(), f2.result(), f3.result()
+
+    seen, combined = set(), []
+    for d in docs_hyde + docs_orig + docs_norm:
+        key = f"{d.metadata.get('source')}_{d.metadata.get('page')}_{hash(d.page_content[:100])}"
+        if key not in seen:
+            seen.add(key)
+            combined.append(d)
+    return combined, hyde_answer
+
+print("\n=== FRAPPE RAG (Advanced) ===")
+features = []
+if ENABLE_HYBRID_SEARCH: features.append("Hybrid Search")
+if ENABLE_PARENT_RETRIEVER: features.append("Parent-Doc Retriever")
+print(f"Features: {', '.join(features) if features else 'Standard'}")
+print("Commands: exit\n")
+
+history = []
+debug = False
+use_hyde = True
+allow_fallback = ENABLE_GENERAL_FALLBACK
+
+while True:
+    try:
+        q = input("You: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        break
+
+    if not q:
+        continue
+    cmd = q.lower()
     
-    # Invoke graph
+    if cmd == "exit":
+        break
+
+    t0 = time.time()
     try:
-        final_state = rag_graph.invoke(initial_state)
+        hyde_answer = None
+        if use_hyde:
+            docs, hyde_answer = hyde_search(q)
+        else:
+            docs = hybrid_search(q, RETRIEVER_K)
+
+        t1 = time.time()
+
+        if not docs:
+            if allow_fallback:
+                print("\n⚠️ Dokümanlarda bilgi bulunamadı.")
+                if input("Genel bilgi? (e/h): ").strip().lower() == 'e':
+                    resp = llm.invoke(PROMPT_GENERAL_FALLBACK.invoke({"question": q})).content.strip()
+                    print(f"\nA: {resp}\n")
+                    continue
+            print("\nA: Bu bilgi dokümanlarda yok.\n")
+            continue
+
+        history_str, history_tokens = format_history(history)
+        available_ctx = TOTAL_MAX_TOKENS - history_tokens - count_tokens(q) - PROMPT_OVERHEAD - 512
+        available_ctx = max(500, available_ctx)
+
+        context, sources, chunks = rerank_with_source(q, docs, hyde_answer, available_ctx)
+        t2 = time.time()
+
+        if context is None:
+            if allow_fallback:
+                print("\n⚠️ Yeterli bilgi bulunamadı.")
+                if input("Genel bilgi? (e/h): ").strip().lower() == 'e':
+                    resp = llm.invoke(PROMPT_GENERAL_FALLBACK.invoke({"question": q})).content.strip()
+                    print(f"\nA: {resp}\n")
+                    history.append({"q": q, "a": resp})
+                    continue
+            print("\nA: Bu bilgi dokümanlarda yok.\n")
+            continue
+
+        if debug:
+            print(f"[DEBUG] Retrieval: {t1-t0:.2f}s | Rerank: {t2-t1:.2f}s | Docs: {len(docs)}")
+
+        prompt = PROMPT.invoke({
+            "context": context, "question": q, "history": history_str
+        })
+
+        gen_tokens = min(512, max(256, TOTAL_MAX_TOKENS - count_tokens(str(prompt))))
+        response_text = llm.invoke(prompt, max_tokens=gen_tokens).content.strip()
+        t3 = time.time()
+
+        print(f"\nA: {response_text}")
         
-        answer = final_state.get("answer", "Error occurred")
-        retrieval_time = final_state.get("retrieval_time", 0.0)
-        llm_time = final_state.get("llm_time", 0.0)
-        total_time = time.time() - start_total
-        
-        # Log with additional metadata
-        complexity = final_state.get("complexity", "UNKNOWN")
-        relevance = final_state.get("relevance_score", 0.0)
-        retries = final_state.get("retry_count", 0)
-        
-        logger.info(
-            f"Query OK (Advanced RAG) | "
-            f"Complexity: {complexity} | "
-            f"Relevance: {relevance:.2f} | "
-            f"Retries: {retries} | "
-            f"Retrieval: {retrieval_time:.3f}s | "
-            f"LLM: {llm_time:.3f}s | "
-            f"Total: {total_time:.3f}s | "
-            f"Q: {question[:40]}..."
-        )
-        
-        return answer, retrieval_time, llm_time, total_time
-        
+        # Simple citation printing
+        unique_sources = list(dict.fromkeys(sources))[:5]
+        if unique_sources:
+            print(f"📄 Kaynaklar: {', '.join(unique_sources)}")
+            
+        if debug:
+            print(f"[DEBUG] Gen: {t3-t2:.2f}s | Total: {t3-t0:.2f}s")
+        print()
+
+        history.append({"q": q, "a": response_text})
+
     except Exception as e:
-        logger.error(f"Graph execution failed: {e}")
-        return "An error occurred during graph execution.", 0.0, 0.0, time.time() - start_total
-
-# ─────────────────────────────────────────────────────────────
-# API ENDPOINTS
-# ─────────────────────────────────────────────────────────────
-@app.post("/query")
-async def query(q: Query):
-    loop = asyncio.get_event_loop()
-    try:
-        answer, retrieval_time, llm_time, total_time = await loop.run_in_executor(
-            executor, process_query_sync, q.question
-        )
-        metrics.record_request(True, retrieval_time, llm_time, total_time)
-        return {
-            "answer": answer,
-            "metrics": {
-                "retrieval_time": round(retrieval_time, 3),
-                "llm_time": round(llm_time, 3),
-                "total_time": round(total_time, 3)
-            }
-        }
-    except Exception as e:
-        logger.error(f"Query failed | Error: {str(e)} | Q: {q.question[:50]}...")
-        metrics.record_request(False, 0, 0, 0)
-        return {"answer": "An error occurred while processing your query.", "error": str(e)}
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "timestamp": datetime.now().isoformat(),
-        "version": "2.1.0"
-    }
-
-@app.get("/metrics")
-def get_metrics():
-    """Get detailed performance metrics"""
-    return {
-        "status": "ok",
-        "timestamp": datetime.now().isoformat(),
-        "metrics": metrics.get_stats()
-    }
-
-@app.get("/stats")
-def get_stats():
-    """Get vectorstore statistics"""
-    try:
-        collection_info = qdrant_client.get_collection(COLLECTION_NAME)
-        return {
-            "status": "ok",
-            "vectorstore": {
-                "type": "Qdrant",
-                "total_documents": collection_info.points_count,
-                "collection_name": COLLECTION_NAME,
-                "vector_size": collection_info.config.params.vectors.size,
-                "distance": str(collection_info.config.params.vectors.distance)
-            }
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.post("/index")
-async def index_documents(req: IndexRequest):
-    """
-    Index PDF files into Qdrant.
-
-    NOTE: This is an explicit step. If Qdrant is empty, retrieval will return no docs.
-    """
-    loop = asyncio.get_event_loop()
-    try:
-        result = await loop.run_in_executor(executor, index_pdfs_sync, req)
-        return result
-    except Exception as e:
-        logger.error(f"Index failed | Error: {str(e)}")
-        return {"status": "error", "message": str(e)}
-
-# ─────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        logger.error(f"Error: {e}")
+        print(f"\nError: {e}\n")
