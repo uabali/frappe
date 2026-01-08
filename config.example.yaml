@@ -1,0 +1,16 @@
+llm_backend: "vllm"
+llm_model: "Qwen2.5-3B-Instruct"
+vllm_base_url: "http://localhost:8282/v1"
+temperature: 0.3
+
+embedding_model: "BAAI/bge-m3"
+reranker_model: "BAAI/bge-reranker-v2-m3"
+
+enable_hybrid: true
+top_k: 6
+chunk_size: 800
+chunk_overlap: 120
+
+qdrant_path: "./qdrant_db"
+collection: "frappe_rag_collection"
+data_dir: "data"

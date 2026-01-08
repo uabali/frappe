@@ -6,6 +6,7 @@ import statistics
 import subprocess
 import argparse
 import os
+import random
 from datetime import datetime
 from dataclasses import dataclass, asdict
 from typing import List, Optional
@@ -15,8 +16,8 @@ SCRIPT_DIR = Path(__file__).parent
 RESULTS_DIR = SCRIPT_DIR / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
-API_URL = "http://localhost:8000/query"
-VLLM_URL = "http://localhost:8082/health"
+API_URL = "http://localhost:8088/query"
+VLLM_URL = "http://localhost:8282/health"
 
 QUESTIONS = [
     "Agile nedir?",
@@ -151,11 +152,14 @@ def run_test(num_users: int, questions: List[str]) -> dict:
     """Run single concurrent test"""
     results.clear()
     threads = []
+
+    shuffled_questions = questions[:]
+    random.shuffle(shuffled_questions)
     
     start_time = time.time()
     
     for i in range(num_users):
-        question = questions[i % len(questions)]
+        question = shuffled_questions[i % len(shuffled_questions)]
         t = threading.Thread(target=send_request, args=(i+1, question))
         threads.append(t)
     
